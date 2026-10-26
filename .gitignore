@@ -1,0 +1,26 @@
+# Never commit secrets and signing material
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+.env
+.env.*
+local.properties
+key.properties
+google-services.json
+**/signing/
+# Android/IDE outputs
+.gradle/
+.idea/
+**/build/
+*.iml
+.cxx/
+.externalNativeBuild/
+# Never publish old binaries or backups
+*.apk
+*.aab
+*.zip
+*.bak
+*.backup
