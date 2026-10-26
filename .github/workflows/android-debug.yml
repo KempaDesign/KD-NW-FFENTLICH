@@ -1,0 +1,195 @@
+name: NestWurzel Android Debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '*.gradle'
+      - '*.gradle.kts'
+      - 'gradle.properties'
+      - '.github/workflows/android-debug.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stop tracked secrets and private files before build
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, subprocess, sys
+          files = [pathlib.Path(p) for p in subprocess.check_output(['git','ls-files','-z']).decode().split('\0') if p]
+          forbidden = {'local.properties','google-services.json','key.properties','.env','.env.local','.env.production'}
+          suffixes = ('.keystore','.jks','.p12','.pfx','.pem','.key','.apk','.aab','.zip')
+          token = re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9_]{25,}\b|\bAKIA[0-9A-Z]{16}\b|\b(?:password|client_secret|api_secret|secret_key|access_token)\s*[:=]\s*["\x27][^"\x27\s\u0024{}]{8,}["\x27]', re.I)
+          errors = []
+          for path in files:
+              if path.name.lower() in forbidden or path.as_posix().lower().endswith(suffixes) or any(part in {'.gradle','build','.idea'} for part in path.parts):
+                  errors.append(f'Forbidden tracked file: {path}')
+                  continue
+              if path.suffix.lower() in {'.kt','.java','.xml','.gradle','.kts','.json','.properties','.yml','.yaml','.md','.txt','.py','.sh'} and path.is_file() and path.stat().st_size < 1000000:
+                  if token.search(path.read_text(encoding='utf-8',errors='ignore')):
+                      errors.append(f'Potential plaintext secret: {path}')
+          if errors:
+              sys.exit('Safety stop!\n' + '\n'.join(errors))
+          print('Pre-build scan passed (not a complete privacy audit).')
+          PY
+
+      - name: Detect full Android source
+        id: source
+        shell: bash
+        run: |
+          if [ -f gradlew ] && [ -d app ] && { [ -f settings.gradle ] || [ -f settings.gradle.kts ]; } && { [ -f app/build.gradle ] || [ -f app/build.gradle.kts ]; }; then
+            echo "kind=source" >> "$GITHUB_OUTPUT"
+            echo "Full project structure detected; source VERSION UNVERIFIED."
+          else
+            echo "kind=smoke" >> "$GITHUB_OUTPUT"
+            echo "Missing Android project: building isolated infrastructure test app only."
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platforms
+        shell: bash
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'platforms;android-36'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Generate temporary debug signing key
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.android"
+          keytool -genkeypair -noprompt -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000
+
+      - name: Restore Firebase config from optional GitHub secret
+        if: steps.source.outputs.kind == 'source'
+        shell: bash
+        env:
+          FIREBASE_JSON_B64: ${{ secrets.NESTWURZEL_GOOGLE_SERVICES_JSON_B64 }}
+        run: |
+          if [ -n "$FIREBASE_JSON_B64" ]; then
+            printf '%s' "$FIREBASE_JSON_B64" | base64 -d > app/google-services.json
+          fi
+
+      - name: Build isolated NestWurzel-source debug APK (unverified version)
+        if: steps.source.outputs.kind == 'source'
+        shell: bash
+        run: |
+          if [ -f app/build.gradle.kts ]; then
+            cat >> app/build.gradle.kts <<'GRADLE'
+          android {
+              buildTypes.getByName("debug").applicationIdSuffix = ".ci"
+          }
+          GRADLE
+          else
+            cat >> app/build.gradle <<'GRADLE'
+          android {
+              buildTypes { debug { applicationIdSuffix ".ci" } }
+          }
+          GRADLE
+          fi
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+          apk=$(find app/build/outputs/apk/debug -maxdepth 1 -name '*.apk' -type f | head -n 1)
+          test -n "$apk"
+          package=$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)
+          echo "APK package ID: $package"
+          case "$package" in *.ci) ;; *) echo 'SAFETY STOP: Debug APK package is not isolated'; exit 1;; esac
+
+      - name: Upload unverified source APK as artifact
+        if: steps.source.outputs.kind == 'source'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NestWurzel-QUELLSTAND-UNGEPRUEFT-CI-APK
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build standalone Android CI test (NOT NestWurzel)
+        if: steps.source.outputs.kind == 'smoke'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-smoke/app/src/main/java/de/kempadesign/citest"
+          cd "$RUNNER_TEMP/ci-smoke"
+          cat > settings.gradle <<'GRADLE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'NestWurzel-CI-Testapp'
+          include ':app'
+          GRADLE
+          cat > build.gradle <<'GRADLE'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          GRADLE
+          cat > app/build.gradle <<'GRADLE'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'de.kempadesign.citest'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'de.kempadesign.citest'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.0.0-ci-test'
+              }
+          }
+          GRADLE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="CI-Test – KEIN NestWurzel" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          XML
+          cat > app/src/main/java/de/kempadesign/citest/MainActivity.java <<'JAVA'
+          package de.kempadesign.citest;
+          public class MainActivity extends android.app.Activity {
+              @Override public void onCreate(android.os.Bundle state) {
+                  super.onCreate(state);
+                  android.widget.TextView message = new android.widget.TextView(this);
+                  message.setText("CI-Build erfolgreich. Dies ist NICHT NestWurzel 2.0.10.");
+                  message.setTextSize(22);
+                  message.setPadding(32,64,32,32);
+                  setContentView(message);
+              }
+          }
+          JAVA
+          gradle --no-daemon :app:assembleDebug
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk | head -n 2
+
+      - name: Upload standalone CI test APK (NOT NestWurzel)
+        if: steps.source.outputs.kind == 'smoke'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NUR-CI-TEST-KEINE-NestWurzel-APK
+          path: ${{ runner.temp }}/ci-smoke/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
